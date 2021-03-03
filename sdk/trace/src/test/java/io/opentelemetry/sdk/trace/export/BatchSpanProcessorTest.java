@@ -457,7 +457,7 @@ class BatchSpanProcessorTest {
     when(mockSpanExporter.shutdown()).thenReturn(CompletableResultCode.ofSuccess());
     BatchSpanProcessor processor = BatchSpanProcessor.builder(mockSpanExporter).build();
     CompletableResultCode result = processor.shutdown();
-    result.join(1, TimeUnit.SECONDS);
+    result.join(10, TimeUnit.SECONDS);
     assertThat(result.isSuccess()).isTrue();
   }
 
@@ -467,7 +467,7 @@ class BatchSpanProcessorTest {
     when(mockSpanExporter.shutdown()).thenReturn(CompletableResultCode.ofFailure());
     BatchSpanProcessor processor = BatchSpanProcessor.builder(mockSpanExporter).build();
     CompletableResultCode result = processor.shutdown();
-    result.join(1, TimeUnit.SECONDS);
+    result.join(10, TimeUnit.SECONDS);
     assertThat(result.isSuccess()).isFalse();
   }
 

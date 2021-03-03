@@ -17,13 +17,14 @@ import io.opentelemetry.sdk.trace.ReadWriteSpan;
 import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.SpanProcessor;
 import io.opentelemetry.sdk.trace.data.SpanData;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.Collection;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -72,7 +73,8 @@ public final class BatchSpanProcessor implements SpanProcessor {
             scheduleDelayNanos,
             maxExportBatchSize,
             exporterTimeoutNanos,
-            new ArrayBlockingQueue<>(maxQueueSize));
+            new ArrayDeque<SpanData>(maxQueueSize),
+            maxQueueSize);
     Thread workerThread = new DaemonThreadFactory(WORKER_THREAD_NAME).newThread(worker);
     workerThread.start();
   }
@@ -123,26 +125,31 @@ public final class BatchSpanProcessor implements SpanProcessor {
     private final long scheduleDelayNanos;
     private final int maxExportBatchSize;
     private final long exporterTimeoutNanos;
-
-    private long nextExportTime;
-
-    private final BlockingQueue<ReadableSpan> queue;
-
-    private final AtomicReference<CompletableResultCode> flushRequested = new AtomicReference<>();
+    private final ArrayDeque<SpanData> queue;
     private volatile boolean continueWork = true;
-    private final ArrayList<SpanData> batch;
+    private final Collection<SpanData> batch;
+    private final int maxQueueSize;
+    private final ReentrantLock lock;
+    private final Condition needExport;
+    private final AtomicReference<CompletableResultCode> flushRequested = new AtomicReference<>();
+    private int spanBatchCounter = 0;
+    private long nextExportTime;
 
     private Worker(
         SpanExporter spanExporter,
         long scheduleDelayNanos,
         int maxExportBatchSize,
         long exporterTimeoutNanos,
-        BlockingQueue<ReadableSpan> queue) {
+        ArrayDeque<SpanData> queue,
+        int maxQueueSize) {
       this.spanExporter = spanExporter;
       this.scheduleDelayNanos = scheduleDelayNanos;
       this.maxExportBatchSize = maxExportBatchSize;
       this.exporterTimeoutNanos = exporterTimeoutNanos;
       this.queue = queue;
+      this.maxQueueSize = maxQueueSize;
+      this.lock = new ReentrantLock();
+      this.needExport = lock.newCondition();
       Meter meter = GlobalMetricsProvider.getMeter("io.opentelemetry.sdk.trace");
       meter
           .longValueObserverBuilder("queueSize")
@@ -173,30 +180,41 @@ public final class BatchSpanProcessor implements SpanProcessor {
     }
 
     private void addSpan(ReadableSpan span) {
-      if (!queue.offer(span)) {
-        droppedSpans.add(1);
+      final ReentrantLock lock = this.lock;
+      lock.lock();
+      try {
+        if (queue.size() == maxQueueSize) {
+          droppedSpans.add(1);
+        } else {
+          queue.offer(span.toSpanData());
+          if (++spanBatchCounter == maxExportBatchSize) {
+            spanBatchCounter = 0;
+            needExport.signal();
+          }
+        }
+      } finally {
+        lock.unlock();
       }
     }
 
     @Override
     public void run() {
       updateNextExportTime();
-
       while (continueWork) {
         if (flushRequested.get() != null) {
           flush();
         }
-
+        lock.lock();
         try {
-          ReadableSpan lastElement = queue.poll(100, TimeUnit.MILLISECONDS);
-          if (lastElement != null) {
-            batch.add(lastElement.toSpanData());
+          needExport.awaitNanos(scheduleDelayNanos);
+          while (!queue.isEmpty() && batch.size() < maxExportBatchSize) {
+            batch.add(queue.poll());
           }
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
-          return;
+        } finally {
+          lock.unlock();
         }
-
         if (batch.size() >= maxExportBatchSize || System.nanoTime() >= nextExportTime) {
           exportCurrentBatch();
           updateNextExportTime();
@@ -205,15 +223,16 @@ public final class BatchSpanProcessor implements SpanProcessor {
     }
 
     private void flush() {
-      int spansToFlush = queue.size();
-      while (spansToFlush > 0) {
-        ReadableSpan span = queue.poll();
-        assert span != null;
-        batch.add(span.toSpanData());
-        spansToFlush--;
-        if (batch.size() >= maxExportBatchSize) {
-          exportCurrentBatch();
+      lock.lock();
+      try {
+        while (!queue.isEmpty()) {
+          batch.add(queue.poll());
+          if (batch.size() >= maxExportBatchSize) {
+            exportCurrentBatch();
+          }
         }
+      } finally {
+        lock.unlock();
       }
       exportCurrentBatch();
       flushRequested.get().succeed();
@@ -247,8 +266,14 @@ public final class BatchSpanProcessor implements SpanProcessor {
 
     private CompletableResultCode forceFlush() {
       CompletableResultCode flushResult = new CompletableResultCode();
-      // we set the atomic here to trigger the worker loop to do a flush on its next iteration.
+      // we set the atomic here to trigger the worker loop to do a flush of the entire queue.
       flushRequested.compareAndSet(null, flushResult);
+      lock.lock();
+      try {
+        needExport.signal();
+      } finally {
+        lock.unlock();
+      }
       CompletableResultCode possibleResult = flushRequested.get();
       // there's a race here where the flush happening in the worker loop could complete before we
       // get what's in the atomic. In that case, just return success, since we know it succeeded in
@@ -262,8 +287,7 @@ public final class BatchSpanProcessor implements SpanProcessor {
       }
 
       try {
-        final CompletableResultCode result =
-            spanExporter.export(Collections.unmodifiableList(batch));
+        final CompletableResultCode result = spanExporter.export(batch);
         result.join(exporterTimeoutNanos, TimeUnit.NANOSECONDS);
         if (result.isSuccess()) {
           exportedSpans.add(batch.size());

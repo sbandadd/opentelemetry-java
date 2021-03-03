@@ -19,7 +19,6 @@ import io.opentelemetry.sdk.trace.samplers.Sampler;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -83,11 +82,6 @@ class TracerProviderConfigurationTest {
                     .extracting("exporterTimeoutNanos")
                     .isEqualTo(TimeUnit.MILLISECONDS.toNanos(30000));
                 assertThat(worker).extracting("maxExportBatchSize").isEqualTo(512);
-                assertThat(worker)
-                    .extracting("queue")
-                    .isInstanceOfSatisfying(
-                        ArrayBlockingQueue.class,
-                        queue -> assertThat(queue.remainingCapacity()).isEqualTo(2048));
                 assertThat(worker).extracting("spanExporter").isEqualTo(exporter);
               });
     } finally {
@@ -119,11 +113,6 @@ class TracerProviderConfigurationTest {
                     .extracting("exporterTimeoutNanos")
                     .isEqualTo(TimeUnit.MILLISECONDS.toNanos(4));
                 assertThat(worker).extracting("maxExportBatchSize").isEqualTo(3);
-                assertThat(worker)
-                    .extracting("queue")
-                    .isInstanceOfSatisfying(
-                        ArrayBlockingQueue.class,
-                        queue -> assertThat(queue.remainingCapacity()).isEqualTo(2));
                 assertThat(worker).extracting("spanExporter").isEqualTo(exporter);
               });
     } finally {
