@@ -17,11 +17,12 @@ import io.opentelemetry.sdk.trace.ReadWriteSpan;
 import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.SpanProcessor;
 import io.opentelemetry.sdk.trace.data.SpanData;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -73,7 +74,7 @@ public final class BatchSpanProcessor implements SpanProcessor {
             scheduleDelayNanos,
             maxExportBatchSize,
             exporterTimeoutNanos,
-            new ArrayDeque<SpanData>(maxQueueSize),
+            new ConcurrentLinkedQueue<SpanData>(),
             maxQueueSize);
     Thread workerThread = new DaemonThreadFactory(WORKER_THREAD_NAME).newThread(worker);
     workerThread.start();
@@ -125,14 +126,14 @@ public final class BatchSpanProcessor implements SpanProcessor {
     private final long scheduleDelayNanos;
     private final int maxExportBatchSize;
     private final long exporterTimeoutNanos;
-    private final ArrayDeque<SpanData> queue;
+    private final ConcurrentLinkedQueue<SpanData> queue;
+    private final AtomicInteger queueSize;
     private volatile boolean continueWork = true;
     private final Collection<SpanData> batch;
     private final int maxQueueSize;
     private final ReentrantLock lock;
     private final Condition needExport;
     private final AtomicReference<CompletableResultCode> flushRequested = new AtomicReference<>();
-    private int spanBatchCounter = 0;
     private long nextExportTime;
 
     private Worker(
@@ -140,13 +141,14 @@ public final class BatchSpanProcessor implements SpanProcessor {
         long scheduleDelayNanos,
         int maxExportBatchSize,
         long exporterTimeoutNanos,
-        ArrayDeque<SpanData> queue,
+        ConcurrentLinkedQueue<SpanData> queue,
         int maxQueueSize) {
       this.spanExporter = spanExporter;
       this.scheduleDelayNanos = scheduleDelayNanos;
       this.maxExportBatchSize = maxExportBatchSize;
       this.exporterTimeoutNanos = exporterTimeoutNanos;
       this.queue = queue;
+      this.queueSize = new AtomicInteger(0);
       this.maxQueueSize = maxQueueSize;
       this.lock = new ReentrantLock();
       this.needExport = lock.newCondition();
@@ -158,7 +160,7 @@ public final class BatchSpanProcessor implements SpanProcessor {
           .setUpdater(
               result ->
                   result.observe(
-                      queue.size(),
+                      queueSize.get(),
                       Labels.of(SPAN_PROCESSOR_TYPE_LABEL, SPAN_PROCESSOR_TYPE_VALUE)))
           .build();
       LongCounter processedSpansCounter =
@@ -180,20 +182,19 @@ public final class BatchSpanProcessor implements SpanProcessor {
     }
 
     private void addSpan(ReadableSpan span) {
-      final ReentrantLock lock = this.lock;
-      lock.lock();
-      try {
-        if (queue.size() == maxQueueSize) {
-          droppedSpans.add(1);
-        } else {
-          queue.offer(span.toSpanData());
-          if (++spanBatchCounter == maxExportBatchSize) {
-            spanBatchCounter = 0;
+      if (queueSize.get() == maxQueueSize) {
+        droppedSpans.add(1);
+      } else {
+        queue.offer(span.toSpanData());
+        int newQueueSize = queueSize.incrementAndGet();
+        if (newQueueSize >= maxExportBatchSize) {
+          lock.lock();
+          try {
             needExport.signal();
+          } finally {
+            lock.unlock();
           }
         }
-      } finally {
-        lock.unlock();
       }
     }
 
@@ -206,14 +207,19 @@ public final class BatchSpanProcessor implements SpanProcessor {
         }
         lock.lock();
         try {
-          needExport.awaitNanos(scheduleDelayNanos);
-          while (!queue.isEmpty() && batch.size() < maxExportBatchSize) {
-            batch.add(queue.poll());
+          long pollWaitTime = nextExportTime - System.nanoTime();
+          if (pollWaitTime > 0) {
+            needExport.awaitNanos(pollWaitTime);
           }
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
+          return;
         } finally {
           lock.unlock();
+        }
+        while (!queue.isEmpty() && batch.size() < maxExportBatchSize) {
+          batch.add(queue.poll());
+          queueSize.decrementAndGet();
         }
         if (batch.size() >= maxExportBatchSize || System.nanoTime() >= nextExportTime) {
           exportCurrentBatch();
@@ -223,16 +229,12 @@ public final class BatchSpanProcessor implements SpanProcessor {
     }
 
     private void flush() {
-      lock.lock();
-      try {
-        while (!queue.isEmpty()) {
-          batch.add(queue.poll());
-          if (batch.size() >= maxExportBatchSize) {
-            exportCurrentBatch();
-          }
+      while (!queue.isEmpty()) {
+        batch.add(queue.poll());
+        queueSize.decrementAndGet();
+        if (batch.size() >= maxExportBatchSize) {
+          exportCurrentBatch();
         }
-      } finally {
-        lock.unlock();
       }
       exportCurrentBatch();
       flushRequested.get().succeed();
@@ -267,12 +269,13 @@ public final class BatchSpanProcessor implements SpanProcessor {
     private CompletableResultCode forceFlush() {
       CompletableResultCode flushResult = new CompletableResultCode();
       // we set the atomic here to trigger the worker loop to do a flush of the entire queue.
-      flushRequested.compareAndSet(null, flushResult);
-      lock.lock();
-      try {
-        needExport.signal();
-      } finally {
-        lock.unlock();
+      if (flushRequested.compareAndSet(null, flushResult)) {
+        lock.lock();
+        try {
+          needExport.signal();
+        } finally {
+          lock.unlock();
+        }
       }
       CompletableResultCode possibleResult = flushRequested.get();
       // there's a race here where the flush happening in the worker loop could complete before we
