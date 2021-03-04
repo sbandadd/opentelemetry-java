@@ -45,6 +45,7 @@ dependencies {
     jmh("io.grpc:grpc-api")
     jmh("io.grpc:grpc-netty-shaded")
     jmh("org.testcontainers:testcontainers") // testContainer for OTLP collector
+    implementation("org.jctools:jctools-core:3.2.0")
 }
 
 sourceSets {

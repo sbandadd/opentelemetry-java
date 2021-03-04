@@ -17,12 +17,11 @@ import io.opentelemetry.sdk.trace.ReadWriteSpan;
 import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.SpanProcessor;
 import io.opentelemetry.sdk.trace.data.SpanData;
+import org.jctools.queues.MpscArrayQueue;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -74,8 +73,7 @@ public final class BatchSpanProcessor implements SpanProcessor {
             scheduleDelayNanos,
             maxExportBatchSize,
             exporterTimeoutNanos,
-            new ConcurrentLinkedQueue<SpanData>(),
-            maxQueueSize);
+            new MpscArrayQueue<ReadableSpan>(maxQueueSize));
     Thread workerThread = new DaemonThreadFactory(WORKER_THREAD_NAME).newThread(worker);
     workerThread.start();
   }
@@ -126,30 +124,25 @@ public final class BatchSpanProcessor implements SpanProcessor {
     private final long scheduleDelayNanos;
     private final int maxExportBatchSize;
     private final long exporterTimeoutNanos;
-    private final ConcurrentLinkedQueue<SpanData> queue;
-    private final AtomicInteger queueSize;
+    private long nextExportTime;
+    private final MpscArrayQueue<ReadableSpan> queue;
+    private final AtomicReference<CompletableResultCode> flushRequested = new AtomicReference<>();
     private volatile boolean continueWork = true;
     private final Collection<SpanData> batch;
-    private final int maxQueueSize;
     private final ReentrantLock lock;
     private final Condition needExport;
-    private final AtomicReference<CompletableResultCode> flushRequested = new AtomicReference<>();
-    private long nextExportTime;
 
     private Worker(
         SpanExporter spanExporter,
         long scheduleDelayNanos,
         int maxExportBatchSize,
         long exporterTimeoutNanos,
-        ConcurrentLinkedQueue<SpanData> queue,
-        int maxQueueSize) {
+        MpscArrayQueue<ReadableSpan> queue) {
       this.spanExporter = spanExporter;
       this.scheduleDelayNanos = scheduleDelayNanos;
       this.maxExportBatchSize = maxExportBatchSize;
       this.exporterTimeoutNanos = exporterTimeoutNanos;
       this.queue = queue;
-      this.queueSize = new AtomicInteger(0);
-      this.maxQueueSize = maxQueueSize;
       this.lock = new ReentrantLock();
       this.needExport = lock.newCondition();
       Meter meter = GlobalMetricsProvider.getMeter("io.opentelemetry.sdk.trace");
@@ -160,7 +153,7 @@ public final class BatchSpanProcessor implements SpanProcessor {
           .setUpdater(
               result ->
                   result.observe(
-                      queueSize.get(),
+                      queue.size(),
                       Labels.of(SPAN_PROCESSOR_TYPE_LABEL, SPAN_PROCESSOR_TYPE_VALUE)))
           .build();
       LongCounter processedSpansCounter =
@@ -182,18 +175,15 @@ public final class BatchSpanProcessor implements SpanProcessor {
     }
 
     private void addSpan(ReadableSpan span) {
-      if (queueSize.get() == maxQueueSize) {
+      if (!queue.offer(span)) {
         droppedSpans.add(1);
-      } else {
-        queue.offer(span.toSpanData());
-        int newQueueSize = queueSize.incrementAndGet();
-        if (newQueueSize >= maxExportBatchSize) {
-          lock.lock();
-          try {
-            needExport.signal();
-          } finally {
-            lock.unlock();
-          }
+      }
+      if (queue.size() >= maxExportBatchSize) {
+        lock.lock();
+        try {
+          needExport.signal();
+        } finally {
+          lock.unlock();
         }
       }
     }
@@ -218,8 +208,7 @@ public final class BatchSpanProcessor implements SpanProcessor {
           lock.unlock();
         }
         while (!queue.isEmpty() && batch.size() < maxExportBatchSize) {
-          batch.add(queue.poll());
-          queueSize.decrementAndGet();
+          batch.add(queue.poll().toSpanData());
         }
         if (batch.size() >= maxExportBatchSize || System.nanoTime() >= nextExportTime) {
           exportCurrentBatch();
@@ -230,8 +219,7 @@ public final class BatchSpanProcessor implements SpanProcessor {
 
     private void flush() {
       while (!queue.isEmpty()) {
-        batch.add(queue.poll());
-        queueSize.decrementAndGet();
+        batch.add(queue.poll().toSpanData());
         if (batch.size() >= maxExportBatchSize) {
           exportCurrentBatch();
         }
