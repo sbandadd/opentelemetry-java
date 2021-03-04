@@ -51,7 +51,7 @@ public class SpanBenchmark {
   @Threads(value = 1)
   @Fork(1)
   @Warmup(iterations = 5, time = 1)
-  @Measurement(iterations = 10, time = 1)
+  @Measurement(iterations = 50, time = 1)
   @OutputTimeUnit(TimeUnit.MILLISECONDS)
   public void simpleSpanStartAddEventEnd_01Thread() {
     doSpanWork();
@@ -61,7 +61,7 @@ public class SpanBenchmark {
   @Threads(value = 5)
   @Fork(1)
   @Warmup(iterations = 5, time = 1)
-  @Measurement(iterations = 10, time = 1)
+  @Measurement(iterations = 50, time = 1)
   @OutputTimeUnit(TimeUnit.MILLISECONDS)
   public void simpleSpanStartAddEventEnd_05Threads() {
     doSpanWork();
@@ -71,7 +71,7 @@ public class SpanBenchmark {
   @Threads(value = 2)
   @Fork(1)
   @Warmup(iterations = 5, time = 1)
-  @Measurement(iterations = 10, time = 1)
+  @Measurement(iterations = 50, time = 1)
   @OutputTimeUnit(TimeUnit.MILLISECONDS)
   public void simpleSpanStartAddEventEnd_02Threads() {
     doSpanWork();
@@ -81,7 +81,7 @@ public class SpanBenchmark {
   @Threads(value = 10)
   @Fork(1)
   @Warmup(iterations = 5, time = 1)
-  @Measurement(iterations = 10, time = 1)
+  @Measurement(iterations = 50, time = 1)
   @OutputTimeUnit(TimeUnit.MILLISECONDS)
   public void simpleSpanStartAddEventEnd_10Threads() {
     doSpanWork();

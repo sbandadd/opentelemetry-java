@@ -11,7 +11,6 @@ import io.opentelemetry.sdk.common.CompletableResultCode;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.data.LongPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
-import io.opentelemetry.sdk.metrics.export.MetricProducer;
 import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.SpanData;
@@ -52,7 +51,6 @@ public class BatchSpanProcessorDroppedSpansBenchmark {
 
   @State(Scope.Benchmark)
   public static class BenchmarkState {
-    private final MetricProducer metricProducer = ((SdkMeterProvider) GlobalMetricsProvider.get());
     private BatchSpanProcessor processor;
     private Tracer tracer;
     private Collection<MetricData> allMetrics;
@@ -61,6 +59,7 @@ public class BatchSpanProcessorDroppedSpansBenchmark {
     public final void setup() {
       SpanExporter exporter = new DelayingSpanExporter();
       processor = BatchSpanProcessor.builder(exporter).build();
+      GlobalMetricsProvider.set(SdkMeterProvider.builder().build());
 
       tracer = SdkTracerProvider.builder().build().get("benchmarkTracer");
     }
@@ -72,7 +71,7 @@ public class BatchSpanProcessorDroppedSpansBenchmark {
 
     @TearDown(Level.Iteration)
     public final void recordMetrics() {
-      allMetrics = metricProducer.collectAllMetrics();
+      allMetrics = ((SdkMeterProvider) GlobalMetricsProvider.get()).collectAllMetrics();
     }
   }
 
@@ -128,6 +127,30 @@ public class BatchSpanProcessorDroppedSpansBenchmark {
     }
   }
 
+  @Benchmark
+  @Fork(1)
+  @Threads(1)
+  @Warmup(iterations = 5, time = 1)
+  @Measurement(iterations = 5, time = 20)
+  @BenchmarkMode(Mode.Throughput)
+  public void export_01Threads(
+      BenchmarkState benchmarkState, @SuppressWarnings("unused") ThreadState threadState) {
+    benchmarkState.processor.onEnd(
+        (ReadableSpan) benchmarkState.tracer.spanBuilder("span").startSpan());
+  }
+
+  @Benchmark
+  @Fork(1)
+  @Threads(2)
+  @Warmup(iterations = 5, time = 1)
+  @Measurement(iterations = 5, time = 20)
+  @BenchmarkMode(Mode.Throughput)
+  public void export_02Threads(
+      BenchmarkState benchmarkState, @SuppressWarnings("unused") ThreadState threadState) {
+    benchmarkState.processor.onEnd(
+        (ReadableSpan) benchmarkState.tracer.spanBuilder("span").startSpan());
+  }
+
   /** Export spans through {@link BatchSpanProcessor}. */
   @Benchmark
   @Fork(1)
@@ -135,7 +158,19 @@ public class BatchSpanProcessorDroppedSpansBenchmark {
   @Warmup(iterations = 5, time = 1)
   @Measurement(iterations = 5, time = 20)
   @BenchmarkMode(Mode.Throughput)
-  public void export(
+  public void export_05Threads(
+      BenchmarkState benchmarkState, @SuppressWarnings("unused") ThreadState threadState) {
+    benchmarkState.processor.onEnd(
+        (ReadableSpan) benchmarkState.tracer.spanBuilder("span").startSpan());
+  }
+
+  @Benchmark
+  @Fork(1)
+  @Threads(10)
+  @Warmup(iterations = 5, time = 1)
+  @Measurement(iterations = 5, time = 20)
+  @BenchmarkMode(Mode.Throughput)
+  public void export_10Threads(
       BenchmarkState benchmarkState, @SuppressWarnings("unused") ThreadState threadState) {
     benchmarkState.processor.onEnd(
         (ReadableSpan) benchmarkState.tracer.spanBuilder("span").startSpan());
